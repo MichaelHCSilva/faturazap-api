@@ -1,0 +1,93 @@
+
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>FaturaZap - Simulador WhatsApp</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #efeae2; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .chat-container { width: 400px; height: 650px; background: #efeae2; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.2); display: flex; flex-direction: column; overflow: hidden; border: 1px solid #ccc; }
+        .chat-header { background: #00a884; color: white; padding: 15px; font-weight: bold; font-size: 16px; display: flex; align-items: center; }
+        .chat-messages { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+        .message { max-width: 75%; padding: 10px; border-radius: 8px; font-size: 14px; line-height: 1.4; word-wrap: break-word; }
+        .user-message { background: #d9fdd3; align-self: flex-end; border-top-right-radius: 0; }
+        .bot-message { background: #ffffff; align-self: flex-start; border-top-left-radius: 0; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
+        .chat-input { display: flex; padding: 10px; background: #f0f2f5; gap: 10px; }
+        .chat-input select, .chat-input input { padding: 10px; border: 1px solid #ccc; border-radius: 20px; outline: none; }
+        .chat-input select { width: 30%; }
+        .chat-input input { flex: 1; }
+        .chat-input button { background: #00a884; color: white; border: none; padding: 10px 15px; border-radius: 50%; cursor: pointer; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="chat-container">
+    <div class="chat-header">🟢 FaturaZap (Simulador WhatsApp)</div>
+    <div class="chat-messages" id="chatMessages">
+        <div class="message bot-message">Olá! Envie um link de QR Code da SEFAZ ou o comando para ver seu resumo financeiro.</div>
+    </div>
+    <div class="chat-input">
+        <select id="msgType">
+            <option value="qrcode">QR Code</option>
+            <option value="pdf">PDF</option>
+            <option value="summary">Resumo</option>
+        </select>
+        <input type="text" id="msgContent" placeholder="Cole o link ou comando aqui..." />
+        <button onclick="sendMessage()">➤</button>
+    </div>
+</div>
+
+<script>
+    async function sendMessage() {
+        const typeSelect = document.getElementById('msgType');
+        const contentInput = document.getElementById('msgContent');
+        const messagesDiv = document.getElementById('chatMessages');
+
+        const type = typeSelect.value;
+        const content = contentInput.value.trim();
+
+        if (!content && type !== 'summary') return;
+
+        // Renderiza a mensagem do usuário na tela
+        const userBubble = document.createElement('div');
+        userBubble.className = 'message user-message';
+        userBubble.innerText = type === 'summary' ? 'Quero meu resumo financeiro' : content;
+        messagesDiv.appendChild(userBubble);
+        contentInput.value = '';
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+        try {
+            let endpoint = '/webhook/whatsapp';
+            let payload = { type: type, content: content };
+
+            if (type === 'summary') {
+                endpoint = '/webhook/summary';
+                payload = {};
+            }
+
+            const response = await fetch(endpoint, {
+                method: type === 'summary' ? 'GET' : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: type === 'summary' ? null : JSON.stringify(payload)
+            });
+
+            const data = await response.json();
+            
+            // Renderiza a resposta do Bot na tela
+            const botBubble = document.createElement('div');
+            botBubble.className = 'message bot-message';
+            botBubble.innerText = data.response_message || data.summary || JSON.stringify(data);
+            messagesDiv.appendChild(botBubble);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+        } catch (error) {
+            const errorBubble = document.createElement('div');
+            errorBubble.className = 'message bot-message';
+            errorBubble.innerText = '❌ Erro de conexão com a API Flask.';
+            messagesDiv.appendChild(errorBubble);
+        }
+    }
+</script>
+
+</body>
+</html>
