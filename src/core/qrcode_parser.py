@@ -67,7 +67,7 @@ def parse_and_save_qrcode(qrcode_url):
             ''', (
                 statement_id,
                 purchase_date,
-                f"[{store_name}] {description}",
+                description,
                 city,
                 street,
                 str(number) if number is not None else None,
