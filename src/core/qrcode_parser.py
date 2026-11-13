@@ -3,7 +3,10 @@ import sqlite3
 import os
 import requests
 from bs4 import BeautifulSoup
-from src.services.gemini_service import extract_receipt_data_with_gemini
+from src.services.gemini_service import (
+    extract_receipt_data_with_gemini,
+    extract_receipt_from_image_with_gemini
+)
 
 DB_PATH = os.path.join("data", "faturazap.db")
 
@@ -25,16 +28,13 @@ def parse_and_save_qrcode(qrcode_url):
 
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Remove tags irrelevantes para limpar o texto enviado à IA
         for script in soup(["script", "style"]):
             script.extract()
             
         raw_page_text = soup.get_text(separator="\n", strip=True)
 
-        # Delega a inteligência de extração para o serviço isolado do Gemini
         data = extract_receipt_data_with_gemini(raw_page_text)
 
-        # Persistência no Banco de Dados SQLite
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
@@ -99,3 +99,72 @@ def parse_and_save_qrcode(qrcode_url):
             print(f"❌ Erro ao salvar na fila de falhas: {db_error}")
 
         return False
+
+
+def parse_and_save_whatsapp_image(image_bytes):
+    """
+    Processa a foto enviada diretamente pelo WhatsApp (fallback quando o QR code físico falha).
+    Usa a visão do Gemini para extrair os dados da imagem e persiste no SQLite.
+    """
+    print("🔄 Processando imagem do cupom via Visão do Gemini (WhatsApp)...")
+    
+    try:
+        data = extract_receipt_from_image_with_gemini(image_bytes)
+
+        total_amount = float(data.get("total_amount", 0.0))
+        if total_amount <= 0:
+            raise ValueError("O valor total extraído da imagem é inválido ou zerado.")
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        payment_method = "Cupom Fiscal / WhatsApp"
+        cursor.execute("INSERT OR IGNORE INTO cards (name) VALUES (?)", (payment_method,))
+        cursor.execute("SELECT id FROM cards WHERE name = ?", (payment_method,))
+        card_id = cursor.fetchone()[0]
+
+        store_name = data.get("store_name", "Estabelecimento Desconhecido")
+        purchase_date = data.get("purchase_date", "00/00/0000")
+        access_key = data.get("access_key", "FOTO_DIRETA")
+
+        cursor.execute('''
+            INSERT INTO statements (card_id, due_date, total_amount, qrcode)
+            VALUES (?, ?, ?, ?)
+        ''', (card_id, purchase_date, total_amount, access_key))
+        statement_id = cursor.lastrowid
+
+        city = data.get("city")
+        street = data.get("street")
+        number = data.get("number")
+
+        for item in data.get("items", []):
+            description = item.get("description") or "Item sem descrição"
+            amount = float(item.get("amount") or 0.0)
+
+            cursor.execute('''
+                INSERT INTO statement_items (statement_id, purchase_date, description, city, street, number, amount, installment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                statement_id,
+                purchase_date,
+                description,
+                city,
+                street,
+                str(number) if number is not None else None,
+                amount,
+                None
+            ))
+
+        conn.commit()
+        conn.close()
+        
+        print(f"✅ Cupom de '{store_name}' processado via Foto do WhatsApp e salvo com sucesso!")
+        return {"status": "success", "data": data}
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"❌ Erro ao processar a foto do cupom: {error_msg}")
+        return {
+            "status": "failed", 
+            "message": "⚠️ Ops! Não consegui ler os dados dessa foto (talvez esteja apagada ou amassada). Quanto foi o valor gasto nessa compra?"
+        }
