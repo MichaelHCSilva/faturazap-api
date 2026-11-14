@@ -1,105 +1,170 @@
 #C:\Users\micha\OneDrive\Documentos\FaturaZap\src\api.py
+"""API Flask do FaturaZap: webhook do WhatsApp, resumo financeiro e simulador web."""
+import logging
 import os
-from flask import Flask, request, jsonify, render_template
+from pathlib import Path
+
+from flask import Flask, jsonify, render_template, request
+
+from src import config
+from src.core import reporter
 from src.core.database import init_db
-from src.core.pdf_parser import parse_and_save_statement
-from src.core.qrcode_parser import parse_and_save_qrcode, parse_and_save_whatsapp_image
-from src.core.reporter import get_financial_summary
+from src.core.formatting import format_brl
+from src.services import ingestion
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__, template_folder="templates")
+app.config["MAX_CONTENT_LENGTH"] = config.MAX_UPLOAD_BYTES
 
-# Inicializa o banco de dados e as tabelas ao subir a aplicação
 init_db()
 
-@app.route("/")
+IMAGE_FAILURE_MESSAGE = (
+    "⚠️ Ops! Não consegui ler os dados dessa foto (talvez esteja apagada ou amassada). "
+    "Quanto foi o valor gasto nessa compra?"
+)
+
+
+# --- Helpers -----------------------------------------------------------------------
+
+def _reply(status: str, message: str, http_status: int = 200):
+    return jsonify({"status": status, "response_message": message}), http_status
+
+
+def _field(name: str):
+    """Lê um campo de form-data ou de JSON."""
+    value = request.form.get(name)
+    if value is None:
+        payload = request.get_json(silent=True)
+        if isinstance(payload, dict):
+            value = payload.get(name)
+    return value
+
+
+def _read_pdf_input():
+    """PDF vindo como upload ('file') ou como nome de arquivo dentro de data/uploads."""
+    upload = request.files.get("file")
+    if upload:
+        return upload.read()
+    filename = _field("content")
+    if filename:
+        path = config.UPLOAD_DIR / Path(filename).name  # .name impede sair da pasta de uploads
+        if path.is_file():
+            return path.read_bytes()
+    return None
+
+
+# --- Handlers por tipo de mensagem ---------------------------------------------------
+
+def _handle_pdf():
+    pdf_bytes = _read_pdf_input()
+    if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
+        return _reply("error", "❌ Envie um arquivo PDF válido.", 400)
+
+    result = ingestion.process_pdf(pdf_bytes)
+    if result.status == "success":
+        return _reply(
+            "success",
+            f"✅ Fatura **{result.store_name}** processada com sucesso!\n"
+            f"💰 Valor Total: {format_brl(result.total_amount)}",
+        )
+    if result.status == "duplicate":
+        return _reply("warning", "ℹ️ Essa fatura já foi processada antes.")
+    return _reply(
+        "failed",
+        "⚠️ Não consegui ler essa fatura. Verifique se o PDF não está protegido por senha ou corrompido.",
+        422,
+    )
+
+
+def _handle_qrcode():
+    url = (_field("content") or "").strip()
+    if not url:
+        return _reply("error", "❌ Link do QR Code não fornecido.", 400)
+
+    result = ingestion.process_qrcode(url)
+    if result.status == "success":
+        return _reply("success", "✅ Cupom fiscal processado e salvo com sucesso!")
+    if result.status == "duplicate":
+        return _reply("warning", "ℹ️ Esse cupom já foi processado antes.")
+    return _reply(
+        "warning",
+        "⚠️ Site da SEFAZ instável. Cupom salvo na fila de reprocessamento automático.",
+    )
+
+
+def _handle_image():
+    upload = request.files.get("image")
+    if upload is None:
+        return _reply("error", "❌ Nenhuma imagem foi enviada.", 400)
+
+    mime_type = upload.mimetype if (upload.mimetype or "").startswith("image/") else "image/jpeg"
+    result = ingestion.process_image(upload.read(), mime_type)
+    if result.status == "success":
+        return _reply(
+            "success",
+            f"✅ Nota de **{result.store_name or 'Estabelecimento'}** processada com sucesso via IA!\n"
+            f"💰 Valor Total: {format_brl(result.total_amount)}\n"
+            f"*(Dados salvos no sistema com sucesso!)*",
+        )
+    if result.status == "duplicate":
+        return _reply("warning", "ℹ️ Esse cupom já foi processado antes.")
+    return _reply("failed", IMAGE_FAILURE_MESSAGE)
+
+
+HANDLERS = {"pdf": _handle_pdf, "qrcode": _handle_qrcode, "image": _handle_image}
+
+
+# --- Rotas ---------------------------------------------------------------------------
+
+@app.get("/")
 def chat_ui():
-    """
-    Exibe o simulador visual de chat no navegador para testes práticos.
-    """
+    """Simulador visual de chat para testes no navegador."""
     return render_template("index.html")
 
-@app.route("/webhook/whatsapp", methods=["POST"])
+
+@app.post("/webhook/whatsapp")
 def whatsapp_webhook():
-    # Verifica se a requisição veio via multipart/form-data (com arquivo de imagem) ou application/json
-    message_type = request.form.get("type") or (request.json.get("type") if request.is_json else None)
-    
+    message_type = _field("type")
     if not message_type:
-        return jsonify({"status": "error", "message": "Tipo de mensagem não informado."}), 400
+        return _reply("error", "❌ Tipo de mensagem não informado.", 400)
+
+    handler = HANDLERS.get(message_type)
+    if handler is None:
+        return _reply("error", "❌ Tipo de mensagem não suportado pelo sistema.", 400)
 
     try:
-        # Fluxo 1: Processamento de PDF
-        if message_type == "pdf":
-            content = request.json.get("content") if request.is_json else request.form.get("content")
-            if content and os.path.exists(content):
-                parse_and_save_statement(content)
-                return jsonify({
-                    "status": "success", 
-                    "response_message": "✅ Fatura em PDF processada e salva com sucesso!"
-                })
-            else:
-                return jsonify({
-                    "status": "error", 
-                    "response_message": "❌ Arquivo PDF não encontrado no servidor."
-                }), 404
-                
-        # Fluxo 2: Processamento de Link de QR Code
-        elif message_type == "qrcode":
-            content = request.json.get("content") if request.is_json else request.form.get("content")
-            if not content:
-                return jsonify({"status": "error", "response_message": "❌ Link do QR Code não fornecido."}), 400
-                
-            success = parse_and_save_qrcode(content)
-            if success:
-                return jsonify({
-                    "status": "success", 
-                    "response_message": "✅ Cupom fiscal processado e salvo com sucesso!"
-                })
-            else:
-                return jsonify({
-                    "status": "warning", 
-                    "response_message": "⚠️ Site da SEFAZ instável. Cupom salvo na fila de reprocessamento automático."
-                })
+        return handler()
+    except Exception:
+        logger.exception("Erro inesperado no webhook (type=%s)", message_type)
+        return _reply("error", "❌ Erro interno ao processar a mensagem.", 500)
 
-        # Fluxo 3: Processamento de Foto do Cupom (Visão do Gemini)
-        elif message_type == "image":
-            if 'image' not in request.files:
-                return jsonify({"status": "error", "response_message": "❌ Nenhuma imagem foi enviada."}), 400
-            
-            image_file = request.files['image']
-            image_bytes = image_file.read()
 
-            result = parse_and_save_whatsapp_image(image_bytes)
-
-            if result.get("status") == "success":
-                data = result.get("data", {})
-                store = data.get("store_name", "Estabelecimento")
-                total = data.get("total_amount", 0.0)
-                return jsonify({
-                    "status": "success",
-                    "response_message": f"✅ Nota de **{store}** processada com sucesso via IA!\n💰 Valor Total: R$ {total:.2f}\n*(Dados salvos no sistema com sucesso!)*"
-                })
-            else:
-                return jsonify({
-                    "status": "failed",
-                    "response_message": result.get("message", "⚠️ Não foi possível ler o cupom.")
-                })
-        
-        else:
-            return jsonify({
-                "status": "error", 
-                "response_message": "❌ Tipo de mensagem não suportado pelo sistema."
-            }), 400
-
-    except Exception as e:
-        return jsonify({"status": "error", "response_message": f"❌ Erro interno: {str(e)}"}), 500
-
-@app.route("/webhook/summary", methods=["GET"])
+@app.get("/webhook/summary")
 def financial_summary():
-    summary_text = get_financial_summary()
-    return jsonify({
-        "status": "success",
-        "response_message": summary_text
-    })
+    return _reply("success", reporter.get_financial_summary())
+
+
+@app.post("/webhook/reprocess")
+def reprocess_failed():
+    """Reprocessa os links de QR Code que estão na fila de falhas."""
+    summary = ingestion.reprocess_failed_qrcodes()
+    return _reply(
+        "success",
+        f"🔄 Reprocessamento: {summary['success']} salvo(s), "
+        f"{summary['duplicate']} duplicado(s), {summary['failed']} ainda com falha.",
+    )
+
+
+@app.errorhandler(413)
+def file_too_large(_error):
+    return _reply("error", "❌ Arquivo grande demais.", 413)
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(
+        host=os.getenv("FLASK_HOST", "127.0.0.1"),
+        port=int(os.getenv("FLASK_PORT", "5000")),
+        debug=os.getenv("FLASK_DEBUG") == "1",
+    )

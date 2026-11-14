@@ -1,106 +1,121 @@
 #C:\Users\micha\OneDrive\Documentos\FaturaZap\src\services\gemini_service.py
-import os
-import json
+"""Todas as chamadas ao Gemini ficam aqui (PDF, texto da SEFAZ, foto e busca de endereço)."""
+import logging
+import re
+from functools import lru_cache
+from typing import Optional, TypeVar
+
 from google import genai
 from google.genai import types
+from pydantic import BaseModel
 
-def extract_receipt_data_with_gemini(raw_page_text):
-    """
-    Envia o texto bruto do cupom fiscal para a API do Gemini com a ferramenta de busca web ativada (v1beta),
-    utilizando o CNPJ e os dados do estabelecimento para validar e buscar o número oficial correto na internet.
-    """
-    client = genai.Client(http_options={'api_version': 'v1beta'})
+from src import config
+from src.core.models import ReceiptData, StatementData
 
-    prompt = f"""
-    Analise o texto extraído da página de uma Nota Fiscal de Consumidor Eletrônica (NFC-e) de qualquer estado do Brasil.
-    Identifique e extraia os dados estritamente em formato JSON puro contendo estas chaves exatas:
-    - "store_name" (nome do estabelecimento, string)
-    - "purchase_date" (data da compra no formato DD/MM/AAAA, string)
-    - "city" (cidade do estabelecimento, string ou null)
-    - "street" (rua ou logradouro do estabelecimento, string ou null)
-    - "number" (número do endereço, string. REGRA CRÍTICA DE VALIDAÇÃO: 
-      1. Se o cupom fiscal original trouxer um número válido (diferente de "0", vazio ou "S/N"), utilize-o.
-      2. Se o número vier como "0", vazio ou ausente, você DEVE procurar na internet utilizando o **CNPJ do estabelecimento** presente no texto da nota fiscal ou o nome da loja + rua + cidade.
-      3. Dê preferência absoluta ao número oficial de cadastro fiscal/CNPJ do local encontrado na web (ex: se o cadastro do CNPJ na receita/web indica 3050, utilize 3050). O campo "number" deve conter estritamente o número oficial apurado).
-    - "total_amount" (valor total da nota fiscal como float)
-    - "items" (lista de objetos contendo:
-        - "description" (nome limpo e descrição pura do produto, sem repetir o nome do mercado, string)
-        - "amount" (valor total do item como float)
-    )
+logger = logging.getLogger(__name__)
 
-    TEXTO DA NOTA FISCAL:
-    {raw_page_text}
-    """
+T = TypeVar("T", bound=BaseModel)
 
+
+class GeminiError(Exception):
+    """Falha na chamada ao Gemini ou resposta fora do formato esperado."""
+
+
+_RECEIPT_RULES = """
+Extraia os dados de uma Nota Fiscal de Consumidor Eletrônica (NFC-e) brasileira.
+Regras:
+- store_name: nome do estabelecimento.
+- cnpj: CNPJ do estabelecimento, somente dígitos (null se não constar).
+- purchase_date: data da compra no formato DD/MM/AAAA.
+- access_key: Chave de Acesso de 44 dígitos, somente dígitos (null se não constar).
+- city, street: cidade e logradouro do estabelecimento.
+- number: número do endereço exatamente como impresso; null se for "0", "S/N" ou ausente.
+- total_amount: valor total a pagar.
+- items: description é o nome limpo do produto (sem o nome do mercado) e amount o valor total do item.
+Use null para o que não constar no documento. Não invente valores.
+""".strip()
+
+_STATEMENT_RULES = """
+Analise esta fatura de cartão de crédito (ou boleto) em PDF e extraia os dados.
+Regras:
+- card_name: nome do banco ou cartão (ex.: Banco do Brasil, Carrefour, Senff).
+- due_date: data de vencimento no formato DD/MM/AAAA.
+- total_amount: valor total da fatura.
+- barcode: código de barras ou linha digitável, se houver.
+- pix_payload: payload do Pix (copia e cola), se houver.
+- items: uma entrada por compra detalhada, com purchase_date (DD/MM/AAAA), description
+  (nome do estabelecimento), city, street, number (quando constarem), amount e
+  installment (ex.: "1/3"; null se for compra à vista).
+Use null para o que não constar no documento. Não invente valores.
+""".strip()
+
+
+@lru_cache(maxsize=1)
+def _client() -> genai.Client:
+    return genai.Client(http_options={"api_version": config.GEMINI_API_VERSION})
+
+
+def _extract(contents: list, schema: type[T]) -> T:
+    """Chama o Gemini pedindo JSON validado pelo schema e devolve o objeto já tipado."""
     try:
-        response_ai = client.models.generate_content(
-            model='gemini-2.5-flash',
+        response = _client().models.generate_content(
+            model=config.GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=schema,
+                temperature=0.0,
+            ),
+        )
+    except Exception as exc:
+        raise GeminiError(f"Falha ao chamar o Gemini: {exc}") from exc
+
+    parsed = response.parsed
+    if not isinstance(parsed, schema):
+        raise GeminiError("O Gemini devolveu uma resposta fora do formato esperado.")
+    return parsed
+
+
+def extract_receipt_from_text(page_text: str) -> ReceiptData:
+    """Interpreta o texto bruto da página da NFC-e na SEFAZ."""
+    return _extract([_RECEIPT_RULES, f"TEXTO DA NOTA FISCAL:\n{page_text}"], ReceiptData)
+
+
+def extract_receipt_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> ReceiptData:
+    """Lê uma foto do cupom com o Gemini Vision."""
+    image = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+    return _extract([image, _RECEIPT_RULES], ReceiptData)
+
+
+def extract_statement_from_pdf(pdf_bytes: bytes) -> StatementData:
+    """Lê a fatura em PDF diretamente (o Gemini aceita PDF nativo, inclusive escaneado)."""
+    pdf = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+    return _extract([pdf, _STATEMENT_RULES], StatementData)
+
+
+def lookup_address_number(
+    cnpj: str, store_name: Optional[str], street: Optional[str], city: Optional[str]
+) -> Optional[str]:
+    """Busca na web o número oficial do endereço a partir do CNPJ. Retorna None se não achar."""
+    prompt = (
+        f"Use a busca na web para descobrir o número do endereço oficial do estabelecimento "
+        f"com CNPJ {cnpj} (nome: {store_name or 'desconhecido'}; rua: {street or 'desconhecida'}; "
+        f"cidade: {city or 'desconhecida'}). Responda SOMENTE com o número, apenas dígitos. "
+        f"Se não encontrar com segurança, responda NAO_ENCONTRADO."
+    )
+    try:
+        response = _client().models.generate_content(
+            model=config.GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                tools=[{'google_search': {}}]
-            )
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.0,
+            ),
         )
-        
-        ai_content = response_ai.text.strip()
-        
-        if "```json" in ai_content:
-            ai_content = ai_content.split("```json")[1].split("```")[0].strip()
-        elif "```" in ai_content:
-            ai_content = ai_content.split("```")[1].split("```")[0].strip()
+    except Exception as exc:
+        raise GeminiError(f"Falha na busca do endereço: {exc}") from exc
 
-        return json.loads(ai_content)
-    
-    except Exception as e:
-        raise Exception(f"Erro na comunicação com a API do Gemini: {str(e)}")
-
-
-def extract_receipt_from_image_with_gemini(image_bytes):
-    """
-    Analisa a imagem binária do cupom enviada pelo WhatsApp usando o Gemini Vision.
-    Extrai dados visuais (nome, data, chave de acesso, endereço, itens e valores)
-    diretamente da foto quando o QR Code físico ou o link da SEFAZ falharem.
-    """
-    client = genai.Client(http_options={'api_version': 'v1beta'})
-
-    prompt = """
-    Analise esta foto de um cupom fiscal brasileiro (NFC-e).
-    Identifique e extraia os dados estritamente em formato JSON puro contendo estas chaves exatas:
-    - "store_name" (nome do estabelecimento, string)
-    - "purchase_date" (data da compra no formato DD/MM/AAAA, string)
-    - "access_key" (a Chave de Acesso de 44 dígitos impressa ao lado do QR code, string ou null)
-    - "city" (cidade do estabelecimento, string ou null)
-    - "street" (rua ou logradouro do estabelecimento, string ou null)
-    - "number" (número do endereço, string. Se for "0" ou ausente, busque na web usando o CNPJ da nota)
-    - "total_amount" (valor total da nota fiscal como float)
-    - "items" (lista de objetos contendo:
-        - "description" (nome limpo e descrição pura do produto, string)
-        - "amount" (valor total do item como float)
-    )
-    """
-
-    try:
-        response_ai = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/jpeg",
-                ),
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                tools=[{'google_search': {}}]
-            )
-        )
-        
-        ai_content = response_ai.text.strip()
-        
-        if "```json" in ai_content:
-            ai_content = ai_content.split("```json")[1].split("```")[0].strip()
-        elif "```" in ai_content:
-            ai_content = ai_content.split("```")[1].split("```")[0].strip()
-
-        return json.loads(ai_content)
-    
-    except Exception as e:
-        raise Exception(f"Erro na visão do Gemini ao processar a imagem do cupom: {str(e)}")
+    answer = re.sub(r"\W", "", response.text or "")
+    if answer.isdigit() and int(answer) > 0:
+        return answer
+    return None

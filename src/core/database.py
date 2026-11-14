@@ -1,67 +1,101 @@
 #C:\Users\micha\OneDrive\Documentos\FaturaZap\src\core\database.py
+"""Conexão e criação do esquema SQLite."""
+import logging
 import sqlite3
-import os
+from contextlib import contextmanager
 
-DB_PATH = os.path.join("data", "faturazap.db")
+from src import config
 
-def init_db():
-    # Garante que o diretório de dados existe localmente
-    os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+logger = logging.getLogger(__name__)
 
-    # Tabela de cartões para armazenar origens dinâmicas
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS cards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
-        )
-    ''')
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+);
 
-    # Tabela de cabeçalho de extratos para faturas ou comprovantes por QR code
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS statements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            card_id INTEGER NOT NULL,
-            due_date TEXT,
-            total_amount REAL,
-            barcode TEXT,
-            qrcode TEXT,
-            FOREIGN KEY (card_id) REFERENCES cards (id)
-        )
-    ''')
+CREATE TABLE IF NOT EXISTS statements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id INTEGER NOT NULL,
+    store_name TEXT,
+    due_date TEXT,
+    total_amount REAL,
+    barcode TEXT,
+    qrcode TEXT,
+    identifier TEXT,
+    FOREIGN KEY (card_id) REFERENCES cards (id)
+);
 
-    # Tabela de itens detalhados do extrato para registros individuais de compras
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS statement_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            statement_id INTEGER NOT NULL,
-            purchase_date TEXT NOT NULL,
-            description TEXT NOT NULL,
-            city TEXT,
-            street TEXT,
-            number TEXT,
-            amount REAL NOT NULL,
-            installment TEXT,
-            FOREIGN KEY (statement_id) REFERENCES statements (id)
-        )
-    ''')
+CREATE TABLE IF NOT EXISTS statement_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    statement_id INTEGER NOT NULL,
+    purchase_date TEXT NOT NULL,
+    description TEXT NOT NULL,
+    city TEXT,
+    street TEXT,
+    number TEXT,
+    amount REAL NOT NULL,
+    installment TEXT,
+    FOREIGN KEY (statement_id) REFERENCES statements (id) ON DELETE CASCADE
+);
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS failed_qrcodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            qrcode_url TEXT NOT NULL UNIQUE,
-            error_message TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+CREATE TABLE IF NOT EXISTS failed_qrcodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    qrcode_url TEXT NOT NULL UNIQUE,
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+# Colunas adicionadas depois da primeira versão: aplicadas em bancos já existentes.
+MIGRATIONS = (
+    ("statements", "store_name", "TEXT"),
+    ("statements", "identifier", "TEXT"),
+)
+
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_statements_card_id ON statements (card_id);
+CREATE INDEX IF NOT EXISTS idx_items_statement_id ON statement_items (statement_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_statements_identifier
+    ON statements (identifier) WHERE identifier IS NOT NULL;
+"""
 
 
+@contextmanager
+def get_connection():
+    """Abre uma conexão com FKs ativas; faz commit no sucesso e rollback em erro."""
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-    conn.commit()
-    conn.close()
-    print("✅ Tabelas 'cards', 'statements' e 'statement_items' criadas com sucesso no banco!")
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def init_db() -> None:
+    """Cria diretórios, tabelas, migrações e índices (idempotente)."""
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    with get_connection() as conn:
+        conn.executescript(SCHEMA)
+        for table, column, ddl in MIGRATIONS:
+            _ensure_column(conn, table, column, ddl)
+        conn.executescript(INDEXES)
+    logger.info("Banco de dados pronto em %s", config.DB_PATH)
+
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     init_db()
