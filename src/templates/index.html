@@ -7,14 +7,26 @@
     <style>
         * { box-sizing: border-box; }
         body { font-family: Arial, sans-serif; background: #efeae2; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .chat-container { width: 400px; max-width: 100%; height: 680px; max-height: 100vh; background: #efeae2; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,.2); display: flex; flex-direction: column; overflow: hidden; border: 1px solid #ccc; }
-        .chat-header { background: #00a884; color: #fff; padding: 15px; font-weight: bold; font-size: 16px; }
+        .chat-container { width: 460px; max-width: 100%; height: 720px; max-height: 100vh; background: #efeae2; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,.2); display: flex; flex-direction: column; overflow: hidden; border: 1px solid #ccc; }
+        .chat-header { background: #00a884; color: #fff; padding: 12px 15px; display: flex; align-items: center; gap: 8px; font-weight: bold; font-size: 15px; }
+        .chat-header span { flex: 1; }
+        .chat-header select { padding: 5px; border-radius: 8px; border: none; font-size: 13px; max-width: 130px; }
+        .chat-header button { background: #fff; color: #00a884; border: none; border-radius: 8px; padding: 6px 8px; cursor: pointer; font-weight: bold; font-size: 12px; }
         .chat-messages { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
-        .message { max-width: 75%; padding: 10px; border-radius: 8px; font-size: 14px; line-height: 1.4; word-wrap: break-word; white-space: pre-wrap; }
+        .message { max-width: 85%; padding: 10px; border-radius: 8px; font-size: 14px; line-height: 1.4; word-wrap: break-word; white-space: pre-wrap; }
+        .message.wide { max-width: 100%; }
         .user-message { background: #d9fdd3; align-self: flex-end; border-top-right-radius: 0; }
         .bot-message { background: #fff; align-self: flex-start; border-top-left-radius: 0; box-shadow: 0 1px 2px rgba(0,0,0,.1); }
         .bot-message.pending { color: #888; font-style: italic; }
         .message img { display: block; max-width: 100%; border-radius: 6px; margin-top: 5px; }
+        .tbl-wrap { overflow-x: auto; margin-top: 8px; white-space: normal; }
+        .tbl-wrap table { border-collapse: collapse; font-size: 12px; width: 100%; }
+        .tbl-wrap th, .tbl-wrap td { border: 1px solid #ddd; padding: 4px 6px; text-align: left; white-space: nowrap; }
+        .tbl-wrap th { background: #f0f2f5; }
+        .tbl-wrap tfoot td { font-weight: bold; background: #f7f7f7; }
+        .chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px; max-height: 150px; overflow-y: auto; }
+        .chip { background: #fff; color: #00a884; border: 1px solid #00a884; border-radius: 16px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
+        .chip:hover { background: #e7f6f2; }
         .chat-input { display: flex; padding: 10px; background: #f0f2f5; gap: 8px; align-items: center; }
         .chat-input select { padding: 8px; border: 1px solid #ccc; border-radius: 15px; outline: none; width: 30%; font-size: 12px; }
         .chat-input input { padding: 8px; border: 1px solid #ccc; border-radius: 15px; outline: none; flex: 1; min-width: 0; font-size: 13px; background: #fff; }
@@ -26,36 +38,45 @@
 <body>
 
 <div class="chat-container">
-    <div class="chat-header">🟢 FaturaZap (Simulador WhatsApp)</div>
-    <div class="chat-messages" id="chatMessages" aria-live="polite">
-        <div class="message bot-message">Olá! Envie um link de QR Code, uma foto do cupom ou um PDF de fatura para testar.</div>
+    <div class="chat-header">
+        <span>🟢 FaturaZap</span>
+        <select id="personSelect" aria-label="Quem está falando"></select>
+        <button id="addPersonBtn" type="button">+ pessoa</button>
     </div>
+    <div class="chat-messages" id="chatMessages" aria-live="polite"></div>
+    <div class="chips" id="chips"></div>
     <div class="chat-input">
         <select id="msgType" aria-label="Tipo de mensagem">
             <option value="qrcode">QR Code (Link)</option>
             <option value="image">📸 Foto do Cupom</option>
             <option value="pdf">📄 PDF</option>
+            <option value="text">💬 Mensagem</option>
             <option value="summary">Resumo</option>
+            <option value="entries">Lançamentos</option>
             <option value="reprocess">Reprocessar fila</option>
         </select>
-        <input type="text" id="textInput" placeholder="Cole o link aqui..." aria-label="Link do QR Code">
+        <input type="text" id="textInput" placeholder="Cole o link aqui..." aria-label="Mensagem">
         <input type="file" id="fileInput" hidden aria-label="Arquivo">
         <button id="sendBtn" type="button" aria-label="Enviar">➤</button>
     </div>
 </div>
 
 <script>
-    // Cada tipo define qual campo de entrada aparece e como a requisição é montada.
     const TYPES = {
-        qrcode:    { input: 'text', field: 'content' },
+        qrcode:    { input: 'text', field: 'content', placeholder: 'Cole o link do QR Code...' },
+        text:      { input: 'text', field: 'content', placeholder: 'Ex.: continuar' },
         image:     { input: 'file', field: 'image', accept: 'image/*', label: '📸 Foto enviada' },
         pdf:       { input: 'file', field: 'file',  accept: 'application/pdf', label: '📄 PDF enviado' },
-        summary:   { input: null, endpoint: '/webhook/summary', method: 'GET',  userText: 'Quero meu resumo financeiro' },
-        reprocess: { input: null, endpoint: '/webhook/reprocess', method: 'POST', userText: 'Reprocessar cupons pendentes' },
+        summary:   { input: null, endpoint: '/webhook/summary', method: 'GET',  userText: 'Quero meu resumo' },
+        entries:   { input: null, endpoint: '/webhook/entries', method: 'GET',  userText: 'Quero meus lançamentos' },
+        reprocess: { input: null, endpoint: '/webhook/reprocess', method: 'POST', userText: 'Reprocessar cupons pendentes', noPerson: true },
     };
 
     const els = {
         messages: document.getElementById('chatMessages'),
+        chips: document.getElementById('chips'),
+        person: document.getElementById('personSelect'),
+        addPerson: document.getElementById('addPersonBtn'),
         type: document.getElementById('msgType'),
         text: document.getElementById('textInput'),
         file: document.getElementById('fileInput'),
@@ -64,25 +85,70 @@
 
     let busy = false;
 
+    function storageGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+    function storageSet(key, value) { try { localStorage.setItem(key, value); } catch (e) { /* ignora */ } }
+
     function escapeHtml(text) {
         return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
-    // Aceita o negrito do WhatsApp (*texto*) e do Markdown (**texto**), sempre escapando o HTML antes.
+    // Aceita o negrito do WhatsApp (*texto*) e do Markdown (**texto**), escapando o HTML antes.
     function formatBotText(text) {
         return escapeHtml(text)
             .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
             .replace(/\*(.+?)\*/g, '<strong>$1</strong>');
     }
 
-    function addMessage(role, { text = '', html = '', node = null, pending = false } = {}) {
+    function renderTable(table) {
+        const wrap = document.createElement('div');
+        wrap.className = 'tbl-wrap';
+        const tbl = document.createElement('table');
+
+        const addRow = (parent, cells, tag) => {
+            const tr = document.createElement('tr');
+            cells.forEach((value) => {
+                const cell = document.createElement(tag);
+                cell.textContent = value;
+                tr.appendChild(cell);
+            });
+            parent.appendChild(tr);
+        };
+
+        const thead = document.createElement('thead');
+        addRow(thead, table.columns, 'th');
+        const tbody = document.createElement('tbody');
+        table.rows.forEach((row) => addRow(tbody, row, 'td'));
+        tbl.appendChild(thead);
+        tbl.appendChild(tbody);
+        if (table.footer) {
+            const tfoot = document.createElement('tfoot');
+            addRow(tfoot, table.footer, 'td');
+            tbl.appendChild(tfoot);
+        }
+        wrap.appendChild(tbl);
+        return wrap;
+    }
+
+    function addMessage(role, { text = '', node = null, pending = false } = {}) {
         const bubble = document.createElement('div');
         bubble.className = `message ${role}-message${pending ? ' pending' : ''}`;
-        if (html) bubble.innerHTML = html; else bubble.textContent = text;
+        bubble.textContent = text;
         if (node) bubble.appendChild(node);
         els.messages.appendChild(bubble);
         els.messages.scrollTop = els.messages.scrollHeight;
         return bubble;
+    }
+
+    function renderChips(options) {
+        els.chips.innerHTML = '';
+        (options || []).forEach((option) => {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'chip';
+            chip.textContent = option.label;
+            chip.addEventListener('click', () => sendMessage(option));
+            els.chips.appendChild(chip);
+        });
     }
 
     function setBusy(value) {
@@ -94,28 +160,68 @@
         const cfg = TYPES[els.type.value];
         els.text.hidden = cfg.input !== 'text';
         els.file.hidden = cfg.input !== 'file';
+        if (cfg.placeholder) els.text.placeholder = cfg.placeholder;
         if (cfg.accept) els.file.accept = cfg.accept;
         els.file.value = '';
     }
 
-    // Monta a mensagem do usuário e o corpo da requisição; devolve null se faltar algo.
-    function buildRequest(type) {
+    // ---- Pessoas ----------------------------------------------------------------
+    async function loadPeople() {
+        const response = await fetch('/people');
+        const people = await response.json();
+        els.person.innerHTML = '';
+        people.forEach((p) => {
+            const option = document.createElement('option');
+            option.value = p.id;
+            option.textContent = p.name;
+            els.person.appendChild(option);
+        });
+        const saved = storageGet('faturazap.person');
+        if (saved && people.some((p) => String(p.id) === saved)) els.person.value = saved;
+        return people;
+    }
+
+    async function addPerson() {
+        const name = (prompt('Nome da pessoa:') || '').trim();
+        if (!name) return;
+        const response = await fetch('/people', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name }),
+        });
+        const data = await response.json();
+        if (!response.ok) return alert(data.response_message || 'Erro ao cadastrar.');
+        await loadPeople();
+        els.person.value = data.id;
+        storageSet('faturazap.person', String(data.id));
+    }
+
+    // ---- Envio ------------------------------------------------------------------
+    // `chip` vem quando o usuário toca num botão: mostra o rótulo e envia o valor como mensagem.
+    function buildRequest(type, chip) {
         const cfg = TYPES[type];
+        const personId = els.person.value;
+        if (!cfg.noPerson && !personId) {
+            alert('Cadastre e selecione uma pessoa primeiro (botão "+ pessoa").');
+            return null;
+        }
 
         if (!cfg.input) {
             addMessage('user', { text: cfg.userText });
-            return { endpoint: cfg.endpoint, options: { method: cfg.method } };
+            const query = cfg.noPerson ? '' : `?person_id=${encodeURIComponent(personId)}`;
+            return { endpoint: cfg.endpoint + query, options: { method: cfg.method } };
         }
 
         const formData = new FormData();
         formData.append('type', type);
+        formData.append('person_id', personId);
 
         if (cfg.input === 'text') {
-            const content = els.text.value.trim();
+            const content = chip ? chip.value : els.text.value.trim();
             if (!content) return null;
-            addMessage('user', { text: content });
+            addMessage('user', { text: chip ? chip.label : content });
             formData.append(cfg.field, content);
-            els.text.value = '';
+            if (!chip) els.text.value = '';
         } else {
             const file = els.file.files[0];
             if (!file) {
@@ -132,16 +238,16 @@
             }
             els.file.value = '';
         }
-
         return { endpoint: '/webhook/whatsapp', options: { method: 'POST', body: formData } };
     }
 
-    async function sendMessage() {
+    async function sendMessage(chip) {
         if (busy) return;
-
-        const request = buildRequest(els.type.value);
+        const type = chip ? 'text' : els.type.value;
+        const request = buildRequest(type, chip);
         if (!request) return;
 
+        renderChips([]);
         setBusy(true);
         const pending = addMessage('bot', { text: 'Processando...', pending: true });
 
@@ -150,6 +256,11 @@
             const data = await response.json();
             pending.classList.remove('pending');
             pending.innerHTML = formatBotText(data.response_message || JSON.stringify(data));
+            if (data.table) {
+                pending.classList.add('wide');
+                pending.appendChild(renderTable(data.table));
+            }
+            renderChips(data.quick_replies);
         } catch (error) {
             pending.classList.remove('pending');
             pending.textContent = '❌ Erro de conexão com a API Flask.';
@@ -159,13 +270,25 @@
         }
     }
 
+    els.person.addEventListener('change', () => {
+        storageSet('faturazap.person', els.person.value);
+        renderChips([]);
+    });
+    els.addPerson.addEventListener('click', addPerson);
     els.type.addEventListener('change', updateInputs);
-    els.send.addEventListener('click', sendMessage);
+    els.send.addEventListener('click', () => sendMessage());
     els.text.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') sendMessage();
     });
 
     updateInputs();
+    loadPeople().then((people) => {
+        addMessage('bot', {
+            text: people.length
+                ? 'Olá! Escolha quem está falando e envie um cupom ou fatura. Eu mostro o que li e pergunto quem participou de cada item.'
+                : 'Olá! Primeiro cadastre as pessoas da família com o botão "+ pessoa".',
+        });
+    });
 </script>
 
 </body>

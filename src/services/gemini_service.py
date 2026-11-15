@@ -7,7 +7,9 @@ from typing import Optional, TypeVar
 
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError
 from pydantic import BaseModel
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src import config
 from src.core.models import ReceiptData, StatementData
@@ -55,6 +57,12 @@ def _client() -> genai.Client:
     return genai.Client(http_options={"api_version": config.GEMINI_API_VERSION})
 
 
+@retry(
+    retry=retry_if_exception_type((ServerError, GeminiError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True,
+)
 def _extract(contents: list, schema: type[T]) -> T:
     """Chama o Gemini pedindo JSON validado pelo schema e devolve o objeto já tipado."""
     try:
@@ -67,6 +75,9 @@ def _extract(contents: list, schema: type[T]) -> T:
                 temperature=0.0,
             ),
         )
+    except ServerError as exc:
+        logger.warning(f"Gemini indisponível (503), tentando novamente... Erro: {exc}")
+        raise
     except Exception as exc:
         raise GeminiError(f"Falha ao chamar o Gemini: {exc}") from exc
 
@@ -93,6 +104,12 @@ def extract_statement_from_pdf(pdf_bytes: bytes) -> StatementData:
     return _extract([pdf, _STATEMENT_RULES], StatementData)
 
 
+@retry(
+    retry=retry_if_exception_type((ServerError, GeminiError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True,
+)
 def lookup_address_number(
     cnpj: str, store_name: Optional[str], street: Optional[str], city: Optional[str]
 ) -> Optional[str]:
@@ -112,6 +129,9 @@ def lookup_address_number(
                 temperature=0.0,
             ),
         )
+    except ServerError as exc:
+        logger.warning(f"Gemini indisponível na busca de endereço (503), tentando novamente... Erro: {exc}")
+        raise
     except Exception as exc:
         raise GeminiError(f"Falha na busca do endereço: {exc}") from exc
 

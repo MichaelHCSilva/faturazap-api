@@ -1,6 +1,10 @@
 #C:\Users\micha\OneDrive\Documentos\FaturaZap\src\services\ingestion.py
 
-"""Casos de uso: transformam PDF, link de QR Code ou foto em extratos salvos no banco."""
+"""Leitura de documentos: transforma PDF, link de QR Code ou foto em um rascunho.
+
+Nada é gravado no banco aqui. O rascunho só é salvo depois que o usuário confirma
+a divisão na conversa (ver conversation.py).
+"""
 import hashlib
 import logging
 import re
@@ -11,7 +15,7 @@ from typing import Optional
 from src import config
 from src.core import repository
 from src.core.models import ReceiptData, StatementData
-from src.core.repository import DuplicateStatementError, NewItem, NewStatement
+from src.core.repository import NewItem, NewStatement
 from src.services import gemini_service
 from src.services.gemini_service import GeminiError
 from src.services.sefaz_scraper import fetch_page_text
@@ -22,14 +26,13 @@ _ACCESS_KEY_IN_URL = re.compile(r"(?<!\d)\d{44}(?!\d)")
 
 
 class IngestionError(Exception):
-    """Dados extraídos inválidos (ex.: valor total zerado)."""
+    """Dados extraídos inválidos (ex.: valor total zerado, nenhum item)."""
 
 
 @dataclass
 class IngestionResult:
     status: str  # "success" | "duplicate" | "failed"
-    store_name: Optional[str] = None
-    total_amount: Optional[float] = None
+    statement: Optional[NewStatement] = None  # rascunho, só quando status == "success"
     error: Optional[str] = None
 
 
@@ -76,6 +79,8 @@ def _receipt_to_statement(
     total = round(data.total_amount or 0.0, 2)
     if total <= 0:
         raise IngestionError("O valor total extraído é inválido ou zerado.")
+    if not data.items:
+        raise IngestionError("Nenhum item foi encontrado no documento.")
 
     purchase_date = data.purchase_date or _today()
     number = _resolve_address_number(data)
@@ -105,6 +110,8 @@ def _statement_from_pdf(data: StatementData, identifier: str) -> NewStatement:
     total = round(data.total_amount or 0.0, 2)
     if total <= 0:
         raise IngestionError("O valor total da fatura é inválido ou zerado.")
+    if not data.items:
+        raise IngestionError("Nenhuma compra foi encontrada na fatura.")
 
     fallback_date = data.due_date or _today()
     items = [
@@ -132,66 +139,75 @@ def _statement_from_pdf(data: StatementData, identifier: str) -> NewStatement:
 
 # --- Casos de uso ------------------------------------------------------------------
 
-def process_pdf(pdf_bytes: bytes) -> IngestionResult:
-    """Fatura/boleto em PDF. O hash do arquivo impede salvar o mesmo PDF duas vezes."""
+def read_pdf(pdf_bytes: bytes) -> IngestionResult:
+    """Fatura/boleto em PDF. O hash do arquivo identifica o documento (e evita gastar IA à toa)."""
     identifier = "pdf:" + hashlib.sha256(pdf_bytes).hexdigest()
+    if repository.identifier_exists(identifier):
+        return IngestionResult("duplicate")
     try:
         data = gemini_service.extract_statement_from_pdf(pdf_bytes)
         statement = _statement_from_pdf(data, identifier)
-        repository.save_statement(statement)
-    except DuplicateStatementError:
-        return IngestionResult("duplicate")
     except Exception as exc:
-        logger.exception("Erro ao processar a fatura em PDF")
+        logger.exception("Erro ao ler a fatura em PDF")
         return IngestionResult("failed", error=str(exc))
-    return IngestionResult("success", statement.card_name, statement.total_amount)
+    return IngestionResult("success", statement)
 
 
-def process_qrcode(url: str) -> IngestionResult:
+def read_qrcode(url: str, owner_id: int) -> IngestionResult:
     """Link de QR Code da SEFAZ. Em caso de falha, o link vai para a fila de reprocessamento."""
+    url_key = _access_key_from_url(url)
+    if repository.identifier_exists(url_key):
+        repository.delete_failed_qrcode(url)
+        return IngestionResult("duplicate")
+
     try:
         page_text = fetch_page_text(url)
         data = gemini_service.extract_receipt_from_text(page_text)
-        identifier = _access_key_from_url(url) or _normalize_access_key(data.access_key)
+        identifier = url_key or _normalize_access_key(data.access_key)
+        if repository.identifier_exists(identifier):
+            repository.delete_failed_qrcode(url)
+            return IngestionResult("duplicate")
         statement = _receipt_to_statement(data, config.CARD_SEFAZ, qrcode=url, identifier=identifier)
-        repository.save_statement(statement)
-    except DuplicateStatementError:
-        repository.delete_failed_qrcode(url)
-        return IngestionResult("duplicate")
     except Exception as exc:
-        logger.exception("Erro ao processar o QR Code")
-        _queue_failure(url, str(exc))
+        logger.exception("Erro ao ler o QR Code")
+        _queue_failure(url, str(exc), owner_id)
         return IngestionResult("failed", error=str(exc))
 
     repository.delete_failed_qrcode(url)
-    return IngestionResult("success", statement.store_name, statement.total_amount)
+    return IngestionResult("success", statement)
 
 
-def process_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> IngestionResult:
+def read_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> IngestionResult:
     """Foto do cupom (Gemini Vision). A chave de 44 dígitos vira o identifier."""
     try:
         data = gemini_service.extract_receipt_from_image(image_bytes, mime_type)
         identifier = _normalize_access_key(data.access_key)
+        if repository.identifier_exists(identifier):
+            return IngestionResult("duplicate")
         statement = _receipt_to_statement(data, config.CARD_WHATSAPP, qrcode=None, identifier=identifier)
-        repository.save_statement(statement)
-    except DuplicateStatementError:
-        return IngestionResult("duplicate")
     except Exception as exc:
-        logger.exception("Erro ao processar a foto do cupom")
+        logger.exception("Erro ao ler a foto do cupom")
         return IngestionResult("failed", error=str(exc))
-    return IngestionResult("success", statement.store_name, statement.total_amount)
+    return IngestionResult("success", statement)
 
 
-def reprocess_failed_qrcodes() -> dict[str, int]:
-    """Tenta de novo todos os links da fila e devolve a contagem por resultado."""
-    summary = {"success": 0, "duplicate": 0, "failed": 0}
-    for url in repository.list_failed_qrcodes():
-        summary[process_qrcode(url).status] += 1
-    return summary
+def reprocess_failed_qrcodes() -> tuple[dict[str, int], list[tuple[int, NewStatement]]]:
+    """Tenta de novo os links da fila. Devolve a contagem e os rascunhos (dono, documento)."""
+    counts = {"success": 0, "duplicate": 0, "failed": 0, "skipped": 0}
+    ready: list[tuple[int, NewStatement]] = []
+    for row in repository.list_failed_qrcodes():
+        if row["owner_id"] is None:  # link antigo, sem dono para perguntar a divisão
+            counts["skipped"] += 1
+            continue
+        result = read_qrcode(row["qrcode_url"], row["owner_id"])
+        counts[result.status] += 1
+        if result.status == "success":
+            ready.append((row["owner_id"], result.statement))
+    return counts, ready
 
 
-def _queue_failure(url: str, error: str) -> None:
+def _queue_failure(url: str, error: str, owner_id: int) -> None:
     try:
-        repository.save_failed_qrcode(url, error)
+        repository.save_failed_qrcode(url, error, owner_id)
     except Exception:
         logger.exception("Não foi possível gravar o link na fila de falhas")

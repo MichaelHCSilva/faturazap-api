@@ -28,6 +28,9 @@ MAX_PAGE_TEXT_CHARS = 60_000
 # API
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
+# Documentos lidos que ainda não foram confirmados (ficam só em memória) expiram depois disto.
+DRAFT_TTL_SECONDS = 24 * 60 * 60
+
 # Nomes das "origens" usadas na tabela cards
 CARD_SEFAZ = "Cupom Fiscal / SEFAZ"
 CARD_WHATSAPP = "Cupom Fiscal / WhatsApp"
